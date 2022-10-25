@@ -1,0 +1,349 @@
+import logging
+import os.path
+import time
+import typing
+
+import aiogram.utils.exceptions
+import pandas as pd
+from pandas.io.excel import ExcelWriter
+
+from aiogram import types
+from aiogram.dispatcher import FSMContext
+from aiogram.types import input_file
+
+from loader import bot
+from config import PATH_TO_RESULT_REPORT
+from parsers.joined_sell import parse_joined_sell
+from parsers.EMA import parse_EMA_comment
+from parsers.drops_detection import parse_DropsDetection_comment
+from parsers.moon_hook_plus_spreaddetection import parse_hook_long_depth_comment, parse_moonstrike_comment
+from parsers.moonshot import parse_moonshot
+from parsers.pump_plus_strike_detection import parse_pumpdetection_plus_strikedetection
+from parsers.puvp_detection import parse_PuvpDetection
+from parsers.stread_detection import parse_StreadDetection
+from parsers.creat_3_list import get_mean_plot
+from parsers.waves import parse_waves_comment
+import openpyxl
+from openpyxl.chart import BarChart, Reference
+from openpyxl.formatting.rule import DataBarRule
+
+
+
+async def get_headers(file_path: os.path, message: types.Message, state: FSMContext):
+    """ Пробегается по файлу и для каждой строки записывает стратегию.
+
+    :param file_path: Путь к файлу, который обрабатываем.
+    :param message: Сообщение от пользователя
+    :return: [strategy_1, strategy_2, ...]
+    """
+    result = []
+    name_strategy=[]
+    unknown_comments = set()
+    with open(file_path, 'r') as file:
+        first_str = file.readline()  # Это строка Binance Report - она не нужна
+        if first_str.split()[:1] != ['Binance']:
+            print(first_str.split()[:1])
+            await message.answer(f"Файл не соответствует шаблону.", reply_markup=types.ReplyKeyboardRemove())
+            await state.finish()
+            return None
+        headers = [header.strip() for header in file.readline().rstrip().split('\t')]
+        try:
+            comment_index = headers.index('Comment')
+        except ValueError:
+            await message.answer(f"Файл не соответствует шаблону.", reply_markup=types.ReplyKeyboardRemove())
+            await state.finish()
+            return None
+        for ind, line in enumerate(file.readlines()):
+            line = line.rstrip().split('\t')
+
+            try:
+                comment = line[comment_index].lstrip()
+            except IndexError:
+                continue
+
+            # Получаем стратегию и оставшийся комментарий
+            if comment[:60].find(';') != -1:
+                print(comment.split(';', maxsplit=1)[1])
+                type_strategy, comment = comment.split(';', maxsplit=1)
+            elif comment[:60].find(':') != -1:
+                type_strategy, comment = comment.split(':', maxsplit=1)
+            else:
+                result.append('')
+                len_before_adding = len(unknown_comments)
+                unknown_comments.add(comment[:100])
+                len_after_adding = len(unknown_comments)
+                if len_before_adding != len_after_adding:
+                    try:
+                        #print(comment)
+                        await message.answer(f"Не могу распознать комментарий на {ind + 3} строке входного файла:\n\n"
+                                             f"{comment[:30]}...", reply_markup=types.ReplyKeyboardRemove())
+                    except:
+                        await message.answer(f"Произошла ошибка при поиске названий стратегий. Возможно, "
+                                             f"какая-то стратегия не была распознана.\n\n"
+                                             f"Ошибка на {ind + 3} строке файла.",
+                                             reply_markup=types.ReplyKeyboardRemove())
+                continue
+            result.append(type_strategy)
+            name_strategy.append(comment.split()[2])
+    return [result, name_strategy]
+
+
+async def download_file(file_path: str, message: types.Message) -> str:
+    """Скачать файл с серверов telegram.
+
+    Скачивает в папку ./data/user_id/
+
+    :param file_path: Путь к файлу на тг сервере.
+    :param message: Сообщение от пользователя.
+    :return: Путь к файлу на компьютере
+    """
+    if not os.path.exists(os.path.join(os.getcwd(), 'data')):
+        os.mkdir(os.path.join(os.getcwd(), 'data'))
+    if not os.path.exists(os.path.join(os.getcwd(), 'data', str(message.chat.id))):
+        os.mkdir(os.path.join(os.getcwd(), 'data', str(message.chat.id)))
+
+    extension_of_file = file_path.split('.')[-1]
+    await bot.download_file(file_path, os.path.join(os.getcwd(), 'data', str(message.chat.id),
+                                                    'report.' + extension_of_file))
+    return os.path.join(os.getcwd(), 'data', str(message.chat.id), 'report.' + extension_of_file)
+
+
+def get_func_to_parse(strategy_name: str):
+    """Возвращает объект функции, которая будет обрабатывать комментарий определенного вида.
+
+    :param strategy_name: Название стратегии в начале комментария.
+    :return: function: Функция, которую можно вызвать в программе.
+    """
+
+    if strategy_name.find('dropsdetection') != -1:
+        return parse_DropsDetection_comment
+    elif strategy_name.find('joined sell') != -1:
+        return parse_joined_sell
+    elif strategy_name.find('moonstrike') != -1:
+        return parse_moonstrike_comment
+    elif strategy_name.find('moonshot') != -1:
+        return parse_moonshot
+    elif strategy_name.find('spreaddetection') != -1:
+        return parse_StreadDetection
+    elif strategy_name.find('emadetection')!= -1:
+        return parse_EMA_comment
+    elif strategy_name.find('autodetection') != -1:
+        return parse_moonstrike_comment
+    elif strategy_name.find('pumpdetection') != -1:
+        return parse_PuvpDetection
+    elif strategy_name.find('hook long depth') != -1:
+        return parse_hook_long_depth_comment
+    #elif strategy_name.find('Waves') or strategy_name.find('waves')!= -1:
+    #    return parse_waves_comment
+    else:
+        return None
+
+
+async def start_parse(file_path: str, message: types.Message, state: FSMContext, file_name: str) -> os.path:
+    """ Главная функция обработки файла.
+
+    Получает все заголовки и создаёт табличку из отчёта.
+
+    :param file_path: Путь к файлу, который обрабатываем.
+    :param message: Сообщение, полученное от пользователя.
+    :param state: Состояние, в котором находится пользователь.
+    :return: os.path: Путь к табличке, которая получена в результате обработки
+    """
+    await message.answer("Начинаю предварительный просмотр файла.", reply_markup=types.ReplyKeyboardRemove())
+    file_on_pc = await download_file(file_path, message)
+    kostel = await get_headers(file_on_pc, message, state)
+    strategies, name_strategies = kostel[0], kostel[1]
+
+    await message.answer(f"Количество стратегий в файле: {len(set(name_strategies))}.\n"
+                         f"Создаю таблицу")
+
+    result = pd.DataFrame()
+
+    with open(file_on_pc, 'r') as file:
+        _ = file.readline()
+        headers = [header.strip() for header in file.readline().strip().split('\t')]
+        if "ProfitUSDT" in headers:
+            index_profite = headers.index("ProfitUSDT")
+        else:
+            index_profite = headers.index("Profit USDT")
+        comment_index = headers.index('Comment')
+        dct_pol, dct_otr, dct_profit, res_dict = {}, {}, {}, {"Название стратегии": [], "Монета": [], "Профит": [],\
+                                                              "Число положительных сделок": [],"Число отрицательных сделок": []}
+        for ind, line in enumerate(file.readlines()):
+            line = line.strip().split('\t')
+            try:
+                strategy_parse = strategies[ind].lower()
+            except IndexError:
+                logging.warning(f"IndexError in start_parse function. {ind}/{len(strategies)}")
+                continue
+            try:
+                if len(line) == 1:
+                    continue
+                key = line[0] + line[c
+                if float(line[index_profite]) > 0:
+                    dct_pol[key] = dct_pol.get(key, 0) + 1
+                else:
+                    dct_otr[key] = dct_otr.get(key, 0) + 1
+                dct_profit[key] = dct_profit.get(key, 0) + float(line[index_profite])
+
+
+            except TypeError as error:
+                logging.error(f"Error in 164 - 167 main_parser.py")
+                logging.error(f"Error message: {error}")
+
+            parsed_comment = get_func_to_parse(strategy_parse)(line[comment_index])
+            try:
+                tmp_df = pd.DataFrame([line + parsed_comment[0]], columns=headers + parsed_comment[1])
+            except TypeError as error:
+                logging.error(f"I don't know how to parse: '{strategy_parse}'")
+                logging.error(f"Error message: {error}")
+                continue
+            except IndexError:
+                continue
+            except ValueError as error:
+                logging.error(f"ValueError while parsing {strategy_parse}")
+                logging.error(f"Error message: {error}")
+                continue
+
+            if result.empty:
+                result = tmp_df
+                print(result.shape)
+            else:
+                try:
+                    result = pd.concat([result, tmp_df], ignore_index=True)
+                except pd.errors.InvalidIndexError as error:
+                    logging.error(f"Error while parsing {strategy_parse}.\n"
+                                  f"Message: {error}")
+                    continue
+        for key, value in dct_pol.items():
+            try:
+                res_dict["Название стратегии"].append(key.split()[1])
+                res_dict["Монета"].append(key.split()[0])
+                res_dict["Профит"].append(dct_profit[key])
+                res_dict["Число положительных сделок"].append(value)
+                res_dict["Число отрицательных сделок"].append(dct_otr.get(key, 0))
+            except IndexError:
+                 logging.error(f'{key} - {value}')
+        max_pol_cdelok, max_otr_cdelok = max(res_dict["Число положительных сделок"]), max(res_dict["Число отрицательных сделок"])
+        result_second = pd.DataFrame.from_dict(res_dict).sort_values(by=["Профит"], ascending=False)
+        index_el, max_el, min_el, last_int = 0, 0, 0, len(result_second.index)
+        for index, num in enumerate(result_second[["Профит"]].values.tolist()):
+            if index == 0:
+                max_el = num[0]
+            if num[0] < 0:
+                index_el = index
+                min_el = result_second[["Профит"]].values.tolist()[len(result_second.index) - 1][0]
+                break
+            if index == last_int:
+                min_el = num[0]
+        info_diagram_mas = [index_el, max_el, min_el, last_int, max_pol_cdelok, max_otr_cdelok]
+        list_math = get_mean_plot(result)
+        dct_3_list = {"Название стратегии": list_math[0], "Параметр": list_math[1],\
+                      "Диапазон": list_math[2], "Математическое ожидание": list_math[3]}
+        result_third = pd.DataFrame.from_dict(dct_3_list)
+    print(result)
+    await create_xlsx(result, result_second, result_third, message, info_diagram_mas, file_name)
+
+
+def create_diagram_xlsx(xlsxname, size, info_diagram_mas) -> None:
+    workbook = openpyxl.load_workbook(xlsxname)
+    worksheert = workbook['Профит']
+
+    values1 = Reference(worksheert, min_col=3, min_row=1, max_col=3, max_row=size + 1)
+    monet_name_1 = Reference(worksheert, min_col=2, min_row=2, max_col=2, max_row=size + 1)
+    values2 = Reference(worksheert, min_col=4, min_row=1, max_col=5, max_row=size + 1)
+
+    ''' Диаграммы на листе профит 
+    chart1 = BarChart()
+    chart1.type = "bar"
+    chart1.width = 15
+    chart1.height = 0.5 * (size + 1)
+    chart1.y_axis.title = 'Величина профита'
+    chart1.add_data(values1, titles_from_data=True)
+    chart1.set_categories(monet_name_1)
+
+    chart2 = BarChart()
+    chart2.type = "bar"
+    chart2.width = 15
+    chart2.height = 0.5 * (size + 1)
+    chart2.y_axis.title = 'Количество сделок'
+    chart2.title = 'Статистика сделок'
+    chart2.add_data(values2, titles_from_data=True)
+    chart2.set_categories(monet_name_1)'''
+
+    data_bar_rule_pol = DataBarRule(start_type="num",
+                                    start_value=0,
+                                    end_type="num",
+                                    end_value=info_diagram_mas[4],
+                                    color="002aff")
+    worksheert.conditional_formatting.add(f"D2:D{size + 1}", data_bar_rule_pol)
+
+    data_bar_rule_otr = DataBarRule(start_type="num",
+                                    start_value=0,
+                                    end_type="num",
+                                    end_value=info_diagram_mas[5],
+                                    color="B22222")
+    worksheert.conditional_formatting.add(f"E2:E{size + 1}", data_bar_rule_otr)
+
+    if info_diagram_mas[0] == 0:
+        data_bar_rule_pol_profit = DataBarRule(start_type="num",
+                                               start_value=0,
+                                               end_type="num",
+                                               end_value=info_diagram_mas[1],
+                                               color="002aff")
+        worksheert.conditional_formatting.add(f"C2:C{size + 1}", data_bar_rule_pol_profit)
+
+    elif info_diagram_mas[0] == 1:
+        data_bar_rule_otr_profit = DataBarRule(start_type="num",
+                                               start_value=0,
+                                               end_type="num",
+                                               end_value=info_diagram_mas[2],
+                                               color="B22222")
+        worksheert.conditional_formatting.add(f"C2:C{size + 1}", data_bar_rule_otr_profit)
+
+    else:
+        data_bar_rule_pol_profit = DataBarRule(start_type="num",
+                                               start_value=0.0,
+                                               end_type="num",
+                                               end_value=info_diagram_mas[1],
+                                               color="002aff")
+        worksheert.conditional_formatting.add(f"C2:C{info_diagram_mas[0] + 1}",  data_bar_rule_pol_profit)
+
+        data_bar_rule_otr_profit = DataBarRule(start_type="num",
+                                               start_value=0.0,
+                                               end_type="num",
+                                               end_value=info_diagram_mas[2],
+                                               color="B22222")
+        worksheert.conditional_formatting.add(f"C{info_diagram_mas[0] + 1}:C{size + 1}",data_bar_rule_otr_profit)
+
+    #worksheert.add_chart(chart1, "G1")
+    #worksheert.add_chart(chart2, "P1")
+    workbook.save(xlsxname)
+
+
+async def create_xlsx(data1: pd.DataFrame, data2: pd.DataFrame, data3: pd.DataFrame, message: types.Message, info_diagram_mas: list, file_name: str) -> None:
+    """Создаёт табличку из обработанного отчёта и отправляет пользователю.
+
+    :param data1: Обработанные данные.
+    :param message: Сообщение от пользователя.
+    """
+    with ExcelWriter(os.path.join(PATH_TO_RESULT_REPORT, f'{message.chat.id}.xlsx'), mode="w") as writer:
+        data1.to_excel(writer, sheet_name="Отчет", index=False)
+        data2.to_excel(writer, sheet_name="Профит", index=False)
+        data3.to_excel(writer, sheet_name="Мат.Ожидания", index=False)
+    create_diagram_xlsx(os.path.join(PATH_TO_RESULT_REPORT, f'{message.chat.id}.xlsx'), len(data2.index), info_diagram_mas)
+    await message.answer(f"Отправляю обработанный отчёт...", reply_markup=types.ReplyKeyboardRemove())
+    flag = False
+    start_time = time.time()
+
+    # Ждем 20 сек на создание файла
+    while not flag and time.time() - start_time < 20:
+        try:
+            file = input_file.InputFile(os.path.join(PATH_TO_RESULT_REPORT, f'{message.chat.id}.xlsx'),
+                                        filename=f'{file_name.split(".")[0]}_parsed.xlsx')
+
+            await message.answer_document(file)
+            flag = True
+        except Exception:
+            continue
+
